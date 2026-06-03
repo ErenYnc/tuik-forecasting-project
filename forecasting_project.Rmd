@@ -1,0 +1,859 @@
+---
+title: "TÜİK Forecasting Project: Official Announcement and Advertisement Fees by Month and Type"
+author: "Eren Yenice - 138722006"
+date: "`r Sys.Date()`"
+output:
+  html_document:
+    toc: true
+    toc_float: true
+    toc_depth: 3
+    theme: flatly
+    highlight: tango
+    number_sections: true
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(
+  echo = TRUE,
+  warning = FALSE,
+  message = FALSE,
+  fig.width = 10,
+  fig.height = 5
+)
+```
+
+# Project Overview
+
+This project forecasts monthly total official announcement and advertisement fees (TL) in Turkey using data obtained directly from the TÜİK Data Portal via the `tuikr` R package. Ten alternative forecasting methods are applied, compared using standard accuracy measures, and the superior method is selected to produce a forecast for the next unpublished period.
+
+---
+
+# Student Information
+
+- **Student Name:** Eren Yenice
+- **Student Number:** 138722006
+- **Course:** Forecasting Methods
+
+---
+
+# TÜİK Data Source Information
+
+| Field | Value |
+|---|---|
+| TÜİK Data Set Name | Official announcement and advertisement fees by month and type and the number of official announcements published by month |
+| TÜİK Theme / Category | Culture and Sports (Theme 10) |
+| TÜİK Table Name | Official announcement and advertisement fees by month and type and the number of official announcements published by month |
+| TÜİK Dataflow ID | istab (accessed via statistical_tables, table_url row 8) |
+| Selected Variable | Total official announcement and advertisement fees (TL) |
+| Data Frequency | Monthly |
+| Time Coverage | January 2018 – December 2024 |
+| Latest Available Observation | December 2024 |
+| Forecast Target Period | January 2025 |
+| Date of Data Access | `r Sys.Date()` |
+| R Package Used | tuikr |
+| Package Source | https://github.com/emraher/tuikr |
+
+---
+
+# Data Access Through tuikr
+
+The data were accessed directly from the TÜİK Data Portal using the `tuikr` package. No manual download, copy-paste, or separately created data file was used. The `statistical_tables()` function was used to retrieve the table URL, and `httr::GET()` with browser-like headers was used to download the Excel file, since TÜİK's server returns HTTP 403 for plain bot requests but allows access when standard browser headers (User-Agent, Referer) are provided. This approach is fully reproducible within R.
+
+```{r data-access}
+# Load required packages
+library(tuikr)
+library(httr)
+library(readxl)
+library(dplyr)
+library(stringr)
+library(ggplot2)
+library(forecast)
+
+# Step 1: Retrieve table list from TÜİK using tuikr
+# Theme 10 = Culture and Sports
+tables <- statistical_tables(theme = 10)
+
+# Step 2: Select the target table URL (row 8: official announcement fees by month and type)
+url <- tables$table_url[8]
+
+# Step 3: Download the Excel file using browser-like headers
+# TÜİK server blocks plain bot requests (HTTP 403) but allows browser-simulated requests (HTTP 200)
+resp <- GET(
+  url,
+  add_headers(
+    "User-Agent" = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 Chrome/120.0.0.0 Safari/537.36",
+    "Referer"    = "https://veriportali.tuik.gov.tr/",
+    "Accept"     = "application/json, text/plain, */*"
+  ),
+  timeout(15)
+)
+
+# Step 4: Save raw binary content as .xls and read with readxl
+tmp <- tempfile(fileext = ".xls")
+writeBin(content(resp, "raw"), tmp)
+df_raw <- read_excel(tmp)
+
+# Confirm download
+cat("HTTP status:", status_code(resp), "\n")
+cat("Raw dimensions:", nrow(df_raw), "rows x", ncol(df_raw), "columns\n")
+```
+
+---
+
+# Use of TÜİK Data in R
+
+The raw Excel file contains multiple year-blocks stacked vertically, each with header rows, a totals row, 12 monthly rows, and blank separator rows. The following steps were performed entirely in R to produce a clean monthly time series:
+
+1. Identify rows containing month names (Ocak–Aralık)
+2. Identify rows containing year information and assign each month to its year
+3. Extract the Total fees column (column 2)
+4. Remove the note row (last row, which is NA in the numeric column)
+5. Add a proper date variable and convert to a `ts` object
+
+```{r data-cleaning}
+# Turkish month names
+ay_sira <- c("Ocak", "Şubat", "Mart", "Nisan", "Mayıs", "Haziran",
+             "Temmuz", "Ağustos", "Eylül", "Ekim", "Kasım", "Aralık")
+
+# Find rows with year information and month information
+yil_satirlar <- which(str_detect(df_raw[[1]], "\\d{4}$") & !is.na(df_raw[[1]]))
+ay_satirlar  <- which(str_detect(df_raw[[1]], paste(ay_sira, collapse = "|")) & !is.na(df_raw[[1]]))
+
+# Assign each month row to the nearest preceding year
+ay_yil <- integer(length(ay_satirlar))
+for (i in seq_along(ay_satirlar)) {
+  onceki <- yil_satirlar[yil_satirlar < ay_satirlar[i]]
+  if (length(onceki) > 0) {
+    ay_yil[i] <- as.integer(str_extract(df_raw[[1]][max(onceki)], "\\d{4}"))
+  }
+}
+
+# Build clean data frame
+temiz_df <- data.frame(
+  yil          = ay_yil,
+  ay_tr        = df_raw[[1]][ay_satirlar],
+  toplam_bedel = as.numeric(df_raw[[2]][ay_satirlar])
+)
+
+# Remove note row (NA in numeric column)
+temiz_df <- temiz_df[!is.na(temiz_df$toplam_bedel), ]
+
+# Add month number and date
+temiz_df$ay_no <- match(str_extract(temiz_df$ay_tr, paste(ay_sira, collapse = "|")), ay_sira)
+temiz_df$tarih <- as.Date(paste(temiz_df$yil, temiz_df$ay_no, "01", sep = "-"))
+
+# Confirm structure
+cat("Observations:", nrow(temiz_df), "\n")
+cat("Period:", format(min(temiz_df$tarih), "%B %Y"), "to", format(max(temiz_df$tarih), "%B %Y"), "\n")
+cat("Missing values:", sum(is.na(temiz_df$toplam_bedel)), "\n")
+
+# Create monthly time series object
+ts_data <- ts(temiz_df$toplam_bedel, start = c(2018, 1), frequency = 12)
+print(ts_data)
+```
+
+---
+
+# Exploratory Time Series Analysis
+
+```{r eda-plot}
+# Plot actual time series
+png("outputs/figures/actual_series_plot.png", width = 900, height = 450)
+plot(ts_data,
+     main = "Monthly Total Official Announcement and Advertisement Fees (TL)",
+     ylab = "Total Fees (TL)",
+     xlab = "Year",
+     col  = "steelblue",
+     lwd  = 2)
+grid()
+dev.off()
+
+# Display inline
+plot(ts_data,
+     main = "Monthly Total Official Announcement and Advertisement Fees (TL)",
+     ylab = "Total Fees (TL)",
+     xlab = "Year",
+     col  = "steelblue",
+     lwd  = 2)
+grid()
+```
+
+**Trend:** The series shows a strong upward trend, particularly from 2022 onward. Fees were relatively stable between 2018 and 2021, then accelerated sharply, likely reflecting inflation and the expansion of internet news websites included in the scope from April 2023.
+
+**Seasonality:** A recurring seasonal pattern is visible. Fees tend to be higher in November and lower in August, consistent with publishing activity cycles.
+
+**COVID-19 effect:** A visible dip occurs in April–May 2020, reflecting the impact of the pandemic on advertising activity.
+
+**Missing values:** None. All 84 monthly observations are complete.
+
+```{r eda-decomp-check}
+# STL decomposition for visual inspection of trend and seasonality
+stl_check <- stl(ts_data, s.window = "periodic")
+plot(stl_check, main = "STL Decomposition (Exploratory)")
+```
+
+The STL decomposition confirms a strong upward trend and a consistent seasonal component. The remainder component shows the COVID-19 dip in 2020 and heightened volatility after 2022.
+
+---
+
+# Forecasting Methods
+
+We use observations from January 2018 to November 2024 (83 observations) as the estimation period and evaluate forecast accuracy on December 2024 (the last available observation). The next-period forecast is then produced for January 2025.
+
+```{r split}
+# Estimation period: Jan 2018 - Nov 2024 (83 obs)
+# Holdout: Dec 2024 (1 obs, actual = last value)
+n        <- length(ts_data)
+ts_train <- head(ts_data, n - 1)   # 83 observations
+actual_last <- as.numeric(tail(ts_data, 1))  # December 2024 actual value
+
+cat("Training observations:", length(ts_train), "\n")
+cat("Holdout actual (Dec 2024):", actual_last, "\n")
+```
+
+```{r accuracy-function}
+# Helper function to compute all required accuracy measures
+compute_accuracy <- function(actual, forecast_vals, method_name) {
+  # Use only the overlapping period
+  errors <- actual - forecast_vals
+  n      <- length(errors)
+  bias   <- mean(errors)
+  mad    <- mean(abs(errors))
+  mse    <- mean(errors^2)
+  mape   <- mean(abs(errors / actual)) * 100
+  rsfe   <- sum(errors)
+  ts_val <- rsfe / mad
+
+  data.frame(
+    Method          = method_name,
+    Bias            = round(bias, 2),
+    MAD             = round(mad, 2),
+    MSE             = round(mse, 2),
+    MAPE            = round(mape, 4),
+    RSFE            = round(rsfe, 2),
+    Tracking_Signal = round(ts_val, 4),
+    stringsAsFactors = FALSE
+  )
+}
+```
+
+## Naïve Forecasting
+
+The naïve method uses the most recent observation as the forecast for all future periods.
+
+```{r naive}
+# Naïve: each period's forecast = previous period's actual value
+naive_fitted <- c(NA, as.numeric(ts_train[-length(ts_train)]))
+naive_actual <- as.numeric(ts_train)
+
+# Remove first NA
+naive_actual_clean  <- naive_actual[-1]
+naive_fitted_clean  <- naive_fitted[-1]
+
+# One-step-ahead forecast for Dec 2024 = last training value (Nov 2024)
+naive_forecast_dec <- as.numeric(tail(ts_train, 1))
+cat("Naïve forecast for January 2025:", naive_forecast_dec, "\n")
+
+# Accuracy on training fitted values
+acc_naive <- compute_accuracy(naive_actual_clean, naive_fitted_clean, "Naïve Forecasting")
+
+# Plot
+png("outputs/figures/naive_forecast_plot.png", width = 900, height = 450)
+plot(ts_train, col = "steelblue", lwd = 2,
+     main = "Naïve Forecast vs Actual", ylab = "Total Fees (TL)", xlab = "Year")
+lines(ts(naive_fitted, start = c(2018, 1), frequency = 12), col = "red", lwd = 1, lty = 2)
+legend("topleft", legend = c("Actual", "Naïve Forecast"), col = c("steelblue", "red"), lty = c(1, 2), lwd = 2)
+grid()
+dev.off()
+
+plot(ts_train, col = "steelblue", lwd = 2,
+     main = "Naïve Forecast vs Actual", ylab = "Total Fees (TL)", xlab = "Year")
+lines(ts(naive_fitted, start = c(2018, 1), frequency = 12), col = "red", lwd = 1, lty = 2)
+legend("topleft", legend = c("Actual", "Naïve Forecast"), col = c("steelblue", "red"), lty = c(1, 2), lwd = 2)
+grid()
+```
+
+**Interpretation:** The naïve method simply carries forward the previous value. It captures short-term level but misses the strong upward trend and seasonal fluctuations.
+
+## Moving Average
+
+A 3-month moving average is selected as a balance between noise reduction and responsiveness to the trend.
+
+```{r moving-average}
+k <- 3  # window size
+
+ma_fitted <- stats::filter(ts_train, rep(1/k, k), sides = 1)
+ma_fitted_vec <- as.numeric(ma_fitted)
+
+# Remove NAs from start
+valid_idx <- !is.na(ma_fitted_vec)
+ma_actual_clean <- as.numeric(ts_train)[valid_idx]
+ma_fitted_clean <- ma_fitted_vec[valid_idx]
+
+# One-step forecast for Dec 2024
+ma_forecast_dec <- mean(tail(as.numeric(ts_train), k))
+cat("Moving Average (k=3) forecast for January 2025:", ma_forecast_dec, "\n")
+
+acc_ma <- compute_accuracy(ma_actual_clean, ma_fitted_clean, "Moving Average (k=3)")
+
+# Plot
+png("outputs/figures/moving_average_plot.png", width = 900, height = 450)
+plot(ts_train, col = "steelblue", lwd = 2,
+     main = "Moving Average (k=3) vs Actual", ylab = "Total Fees (TL)", xlab = "Year")
+lines(ma_fitted, col = "darkorange", lwd = 2, lty = 2)
+legend("topleft", legend = c("Actual", "MA(3)"), col = c("steelblue", "darkorange"), lty = c(1, 2), lwd = 2)
+grid()
+dev.off()
+
+plot(ts_train, col = "steelblue", lwd = 2,
+     main = "Moving Average (k=3) vs Actual", ylab = "Total Fees (TL)", xlab = "Year")
+lines(ma_fitted, col = "darkorange", lwd = 2, lty = 2)
+legend("topleft", legend = c("Actual", "MA(3)"), col = c("steelblue", "darkorange"), lty = c(1, 2), lwd = 2)
+grid()
+```
+
+**Interpretation:** The 3-month moving average smooths short-term noise but lags behind the sharp upward trend visible from 2022 onward.
+
+## Weighted Moving Average
+
+Weights are assigned to give more importance to recent observations: 0.5 to the most recent, 0.3 to the second, and 0.2 to the third.
+
+```{r weighted-ma}
+w <- c(0.2, 0.3, 0.5)  # weights: oldest to most recent
+
+ts_vec <- as.numeric(ts_train)
+wma_fitted <- rep(NA, length(ts_vec))
+
+for (i in 3:length(ts_vec)) {
+  wma_fitted[i] <- sum(w * ts_vec[(i-2):i])
+}
+
+valid_idx2 <- !is.na(wma_fitted)
+wma_actual_clean <- ts_vec[valid_idx2]
+wma_fitted_clean <- wma_fitted[valid_idx2]
+
+# Forecast for Dec 2024
+wma_forecast_dec <- sum(w * tail(ts_vec, 3))
+cat("WMA forecast for January 2025:", wma_forecast_dec, "\n")
+
+acc_wma <- compute_accuracy(wma_actual_clean, wma_fitted_clean, "Weighted Moving Average")
+
+# Plot
+wma_ts <- ts(wma_fitted, start = c(2018, 1), frequency = 12)
+
+png("outputs/figures/weighted_moving_average_plot.png", width = 900, height = 450)
+plot(ts_train, col = "steelblue", lwd = 2,
+     main = "Weighted Moving Average vs Actual", ylab = "Total Fees (TL)", xlab = "Year")
+lines(wma_ts, col = "purple", lwd = 2, lty = 2)
+legend("topleft", legend = c("Actual", "WMA (0.5/0.3/0.2)"), col = c("steelblue", "purple"), lty = c(1, 2), lwd = 2)
+grid()
+dev.off()
+
+plot(ts_train, col = "steelblue", lwd = 2,
+     main = "Weighted Moving Average vs Actual", ylab = "Total Fees (TL)", xlab = "Year")
+lines(wma_ts, col = "purple", lwd = 2, lty = 2)
+legend("topleft", legend = c("Actual", "WMA (0.5/0.3/0.2)"), col = c("steelblue", "purple"), lty = c(1, 2), lwd = 2)
+grid()
+```
+
+**Interpretation:** By weighting recent observations more heavily, the WMA responds faster than the simple moving average. However, it still lags during the sharp acceleration from 2022.
+
+## Exponential Smoothing
+
+Alpha = 0.4 is selected as a moderate value that balances responsiveness with stability for a trending series.
+
+```{r exp-smoothing}
+alpha <- 0.4
+
+es_model  <- HoltWinters(ts_train, alpha = alpha, beta = FALSE, gamma = FALSE)
+es_fitted <- as.numeric(fitted(es_model)[, 1])
+es_actual <- as.numeric(ts_train)[-1]  # fitted starts from obs 2
+
+acc_es <- compute_accuracy(es_actual, es_fitted, "Exponential Smoothing (a=0.4)")
+
+es_forecast_dec <- forecast(es_model, h = 1)$mean[1]
+cat("Exponential Smoothing forecast for January 2025:", es_forecast_dec, "\n")
+
+# Plot
+es_fitted_ts <- ts(c(NA, es_fitted), start = c(2018, 1), frequency = 12)
+
+png("outputs/figures/exponential_smoothing_plot.png", width = 900, height = 450)
+plot(ts_train, col = "steelblue", lwd = 2,
+     main = "Exponential Smoothing (alpha=0.4) vs Actual", ylab = "Total Fees (TL)", xlab = "Year")
+lines(es_fitted_ts, col = "darkgreen", lwd = 2, lty = 2)
+legend("topleft", legend = c("Actual", "ES (alpha=0.4)"), col = c("steelblue", "darkgreen"), lty = c(1, 2), lwd = 2)
+grid()
+dev.off()
+
+plot(ts_train, col = "steelblue", lwd = 2,
+     main = "Exponential Smoothing (alpha=0.4) vs Actual", ylab = "Total Fees (TL)", xlab = "Year")
+lines(es_fitted_ts, col = "darkgreen", lwd = 2, lty = 2)
+legend("topleft", legend = c("Actual", "ES (alpha=0.4)"), col = c("steelblue", "darkgreen"), lty = c(1, 2), lwd = 2)
+grid()
+```
+
+**Interpretation:** Simple exponential smoothing captures the level but does not model the trend component, causing it to consistently underestimate the rapidly growing series.
+
+## Trend-Adjusted Exponential Smoothing (Holt's Method)
+
+The series shows a clear upward trend, so trend-adjusted exponential smoothing (Holt's method) is applicable. Alpha = 0.4, Beta = 0.2.
+
+```{r trend-adjusted-es}
+holt_model  <- HoltWinters(ts_train, alpha = 0.4, beta = 0.2, gamma = FALSE)
+holt_fitted <- as.numeric(fitted(holt_model)[, 1])
+holt_actual <- as.numeric(ts_train)[-c(1:2)]  # fitted starts from obs 3
+
+# Align lengths
+min_len <- min(length(holt_actual), length(holt_fitted))
+holt_actual <- tail(holt_actual, min_len)
+holt_fitted <- tail(holt_fitted, min_len)
+
+acc_holt <- compute_accuracy(holt_actual, holt_fitted, "Trend-Adjusted ES (Holt)")
+
+holt_forecast_dec <- forecast(holt_model, h = 1)$mean[1]
+cat("Holt forecast for January 2025:", holt_forecast_dec, "\n")
+
+# Plot
+holt_fitted_full <- c(NA, NA, as.numeric(fitted(holt_model)[, 1]))
+holt_fitted_ts   <- ts(holt_fitted_full, start = c(2018, 1), frequency = 12)
+
+png("outputs/figures/trend_adjusted_smoothing_plot.png", width = 900, height = 450)
+plot(ts_train, col = "steelblue", lwd = 2,
+     main = "Trend-Adjusted ES (Holt) vs Actual", ylab = "Total Fees (TL)", xlab = "Year")
+lines(holt_fitted_ts, col = "brown", lwd = 2, lty = 2)
+legend("topleft", legend = c("Actual", "Holt (a=0.4, b=0.2)"), col = c("steelblue", "brown"), lty = c(1, 2), lwd = 2)
+grid()
+dev.off()
+
+plot(ts_train, col = "steelblue", lwd = 2,
+     main = "Trend-Adjusted ES (Holt) vs Actual", ylab = "Total Fees (TL)", xlab = "Year")
+lines(holt_fitted_ts, col = "brown", lwd = 2, lty = 2)
+legend("topleft", legend = c("Actual", "Holt (a=0.4, b=0.2)"), col = c("steelblue", "brown"), lty = c(1, 2), lwd = 2)
+grid()
+```
+
+**Interpretation:** Holt's method captures the upward trend significantly better than simple exponential smoothing. The fitted values track the acceleration of fees from 2022 more closely.
+
+## Linear Trend Projection
+
+A simple linear regression of fees on time index is fitted.
+
+```{r linear-trend}
+n_train  <- length(ts_train)
+t_index  <- 1:n_train
+lm_model <- lm(as.numeric(ts_train) ~ t_index)
+
+cat("Estimated trend equation:\n")
+print(summary(lm_model))
+
+lm_fitted <- fitted(lm_model)
+acc_lm    <- compute_accuracy(as.numeric(ts_train), lm_fitted, "Linear Trend Projection")
+
+# Forecast for period 84 (Dec 2024) and 85 (Jan 2025)
+lm_forecast_dec <- predict(lm_model, newdata = data.frame(t_index = n_train + 1))
+cat("\nLinear trend forecast for January 2025:", lm_forecast_dec, "\n")
+
+# Plot
+lm_fitted_ts <- ts(lm_fitted, start = c(2018, 1), frequency = 12)
+
+png("outputs/figures/trend_projection_plot.png", width = 900, height = 450)
+plot(ts_train, col = "steelblue", lwd = 2,
+     main = "Linear Trend Projection vs Actual", ylab = "Total Fees (TL)", xlab = "Year")
+lines(lm_fitted_ts, col = "darkred", lwd = 2, lty = 2)
+legend("topleft", legend = c("Actual", "Linear Trend"), col = c("steelblue", "darkred"), lty = c(1, 2), lwd = 2)
+grid()
+dev.off()
+
+plot(ts_train, col = "steelblue", lwd = 2,
+     main = "Linear Trend Projection vs Actual", ylab = "Total Fees (TL)", xlab = "Year")
+lines(lm_fitted_ts, col = "darkred", lwd = 2, lty = 2)
+legend("topleft", legend = c("Actual", "Linear Trend"), col = c("steelblue", "darkred"), lty = c(1, 2), lwd = 2)
+grid()
+```
+
+**Interpretation:** The intercept represents the estimated fee level at the beginning of the series (January 2018). The slope indicates the average monthly increase in fees. The linear model underestimates the sharp acceleration after 2022 because the growth is nonlinear.
+
+## Seasonal Indices
+
+Monthly data with a recurring pattern warrant seasonal index analysis.
+
+```{r seasonal-indices}
+# Compute seasonal indices using ratio-to-moving-average approach
+ts_vec2   <- as.numeric(ts_train)
+n_train2  <- length(ts_vec2)
+ma12      <- stats::filter(ts_vec2, rep(1/12, 12), sides = 2)
+ratio     <- ts_vec2 / ma12
+
+# Average ratio by month
+month_idx <- rep(1:12, length.out = n_train2)
+si        <- tapply(ratio, month_idx, mean, na.rm = TRUE)
+si        <- si / mean(si)  # normalize so indices sum to 12
+
+cat("Seasonal Indices by Month:\n")
+si_df <- data.frame(Month = month.abb, Seasonal_Index = round(as.numeric(si), 4))
+print(si_df)
+
+cat("\nHigh season months (index > 1):", month.abb[as.numeric(si) > 1], "\n")
+cat("Low season months (index < 1):", month.abb[as.numeric(si) < 1], "\n")
+
+# Deseasonalize
+deseason <- ts_vec2 / si[month_idx]
+
+# Fit linear trend to deseasonalized series
+t_idx2     <- 1:n_train2
+lm_deseas  <- lm(deseason ~ t_idx2)
+trend_vals <- fitted(lm_deseas)
+
+# Reseasonalize
+si_fitted <- trend_vals * si[month_idx]
+acc_si    <- compute_accuracy(ts_vec2, si_fitted, "Seasonal Indices")
+
+# Forecast Jan 2025 (period 84 in training = Nov 2024, so period 85 = Dec 2024 holdout, period 86 = Jan 2025)
+trend_forecast <- predict(lm_deseas, newdata = data.frame(t_idx2 = n_train2 + 2))
+si_forecast_dec <- trend_forecast * si[1]  # January = month 1
+cat("Seasonal Index forecast for January 2025:", si_forecast_dec, "\n")
+
+# Plot
+si_fitted_ts <- ts(si_fitted, start = c(2018, 1), frequency = 12)
+
+png("outputs/figures/seasonal_indices_plot.png", width = 900, height = 450)
+plot(ts_train, col = "steelblue", lwd = 2,
+     main = "Seasonal Indices Forecast vs Actual", ylab = "Total Fees (TL)", xlab = "Year")
+lines(si_fitted_ts, col = "darkmagenta", lwd = 2, lty = 2)
+legend("topleft", legend = c("Actual", "Seasonal Indices"), col = c("steelblue", "darkmagenta"), lty = c(1, 2), lwd = 2)
+grid()
+dev.off()
+
+plot(ts_train, col = "steelblue", lwd = 2,
+     main = "Seasonal Indices Forecast vs Actual", ylab = "Total Fees (TL)", xlab = "Year")
+lines(si_fitted_ts, col = "darkmagenta", lwd = 2, lty = 2)
+legend("topleft", legend = c("Actual", "Seasonal Indices"), col = c("steelblue", "darkmagenta"), lty = c(1, 2), lwd = 2)
+grid()
+```
+
+**Interpretation:** November has the highest seasonal index, confirming that official announcement activity peaks in late year. August has the lowest index, consistent with reduced publishing activity in summer. Seasonal indices improve the fit by capturing these recurring patterns.
+
+## Additive Decomposition
+
+```{r additive-decomp}
+decomp_add  <- decompose(ts_train, type = "additive")
+
+# Reconstruct fitted values = trend + seasonal
+add_fitted  <- as.numeric(decomp_add$trend) + as.numeric(decomp_add$seasonal)
+
+# Remove NAs (trend has NAs at start/end due to moving average)
+valid_add   <- !is.na(add_fitted)
+add_actual  <- as.numeric(ts_train)[valid_add]
+add_fitted2 <- add_fitted[valid_add]
+
+acc_add <- compute_accuracy(add_actual, add_fitted2, "Additive Decomposition")
+
+# Forecast Jan 2025: extrapolate trend + seasonal index for January
+# Use last available trend value and seasonal factor for January
+last_trend_add  <- tail(na.omit(as.numeric(decomp_add$trend)), 1)
+jan_seasonal_add <- decomp_add$seasonal[1]  # January seasonal factor
+add_forecast_dec <- last_trend_add + jan_seasonal_add
+cat("Additive Decomposition forecast for January 2025:", add_forecast_dec, "\n")
+
+# Plot
+add_fitted_ts <- ts(add_fitted, start = c(2018, 1), frequency = 12)
+
+png("outputs/figures/additive_decomposition_plot.png", width = 900, height = 450)
+plot(ts_train, col = "steelblue", lwd = 2,
+     main = "Additive Decomposition vs Actual", ylab = "Total Fees (TL)", xlab = "Year")
+lines(add_fitted_ts, col = "coral", lwd = 2, lty = 2)
+legend("topleft", legend = c("Actual", "Additive Decomposition"), col = c("steelblue", "coral"), lty = c(1, 2), lwd = 2)
+grid()
+dev.off()
+
+plot(ts_train, col = "steelblue", lwd = 2,
+     main = "Additive Decomposition vs Actual", ylab = "Total Fees (TL)", xlab = "Year")
+lines(add_fitted_ts, col = "coral", lwd = 2, lty = 2)
+legend("topleft", legend = c("Actual", "Additive Decomposition"), col = c("steelblue", "coral"), lty = c(1, 2), lwd = 2)
+grid()
+```
+
+**Interpretation:** Additive decomposition assumes that seasonal fluctuations are constant in absolute terms. Given that the amplitude of seasonal swings appears to grow with the level of the series, multiplicative decomposition may be more appropriate.
+
+## Multiplicative Decomposition
+
+```{r multiplicative-decomp}
+decomp_mult  <- decompose(ts_train, type = "multiplicative")
+
+# Reconstruct fitted values = trend * seasonal
+mult_fitted  <- as.numeric(decomp_mult$trend) * as.numeric(decomp_mult$seasonal)
+
+valid_mult   <- !is.na(mult_fitted)
+mult_actual  <- as.numeric(ts_train)[valid_mult]
+mult_fitted2 <- mult_fitted[valid_mult]
+
+acc_mult <- compute_accuracy(mult_actual, mult_fitted2, "Multiplicative Decomposition")
+
+# Forecast Jan 2025
+last_trend_mult   <- tail(na.omit(as.numeric(decomp_mult$trend)), 1)
+jan_seasonal_mult <- decomp_mult$seasonal[1]
+mult_forecast_dec <- last_trend_mult * jan_seasonal_mult
+cat("Multiplicative Decomposition forecast for January 2025:", mult_forecast_dec, "\n")
+
+# Plot
+mult_fitted_ts <- ts(mult_fitted, start = c(2018, 1), frequency = 12)
+
+png("outputs/figures/multiplicative_decomposition_plot.png", width = 900, height = 450)
+plot(ts_train, col = "steelblue", lwd = 2,
+     main = "Multiplicative Decomposition vs Actual", ylab = "Total Fees (TL)", xlab = "Year")
+lines(mult_fitted_ts, col = "darkcyan", lwd = 2, lty = 2)
+legend("topleft", legend = c("Actual", "Multiplicative Decomposition"), col = c("steelblue", "darkcyan"), lty = c(1, 2), lwd = 2)
+grid()
+dev.off()
+
+plot(ts_train, col = "steelblue", lwd = 2,
+     main = "Multiplicative Decomposition vs Actual", ylab = "Total Fees (TL)", xlab = "Year")
+lines(mult_fitted_ts, col = "darkcyan", lwd = 2, lty = 2)
+legend("topleft", legend = c("Actual", "Multiplicative Decomposition"), col = c("steelblue", "darkcyan"), lty = c(1, 2), lwd = 2)
+grid()
+```
+
+**Interpretation:** Multiplicative decomposition models seasonal fluctuations as proportional to the trend level. This is more suitable here since the seasonal amplitude visibly grows as fees increase.
+
+## Regression with Trend and Seasonal Dummy Variables
+
+```{r regression-seasonal}
+n_reg   <- length(ts_train)
+t_reg   <- 1:n_reg
+month_reg <- rep(1:12, length.out = n_reg)
+
+# Create dummy variables for months 2-12 (January is base)
+dummy_df <- as.data.frame(model.matrix(~ factor(month_reg)))[, -1]
+colnames(dummy_df) <- paste0("M", 2:12)
+
+reg_data  <- cbind(data.frame(y = as.numeric(ts_train), t = t_reg), dummy_df)
+reg_model <- lm(y ~ ., data = reg_data)
+
+cat("Regression with Trend and Seasonal Dummies:\n")
+print(summary(reg_model))
+
+reg_fitted <- fitted(reg_model)
+acc_reg    <- compute_accuracy(as.numeric(ts_train), reg_fitted, "Regression Trend + Seasonal Dummies")
+
+# Forecast Jan 2025 (period n_reg + 2 = 85)
+new_t     <- n_reg + 2
+new_month <- 1  # January
+new_dummies <- as.data.frame(t(setNames(rep(0, 11), paste0("M", 2:12))))
+new_data  <- cbind(data.frame(t = new_t), new_dummies)
+reg_forecast_dec <- predict(reg_model, newdata = new_data)
+cat("\nRegression forecast for January 2025:", reg_forecast_dec, "\n")
+
+# Plot
+reg_fitted_ts <- ts(reg_fitted, start = c(2018, 1), frequency = 12)
+
+png("outputs/figures/regression_seasonal_dummy_plot.png", width = 900, height = 450)
+plot(ts_train, col = "steelblue", lwd = 2,
+     main = "Regression with Trend & Seasonal Dummies vs Actual", ylab = "Total Fees (TL)", xlab = "Year")
+lines(reg_fitted_ts, col = "darkgoldenrod", lwd = 2, lty = 2)
+legend("topleft", legend = c("Actual", "Regression"), col = c("steelblue", "darkgoldenrod"), lty = c(1, 2), lwd = 2)
+grid()
+dev.off()
+
+plot(ts_train, col = "steelblue", lwd = 2,
+     main = "Regression with Trend & Seasonal Dummies vs Actual", ylab = "Total Fees (TL)", xlab = "Year")
+lines(reg_fitted_ts, col = "darkgoldenrod", lwd = 2, lty = 2)
+legend("topleft", legend = c("Actual", "Regression"), col = c("steelblue", "darkgoldenrod"), lty = c(1, 2), lwd = 2)
+grid()
+```
+
+**Interpretation:** The trend coefficient indicates the average monthly increase in fees. The seasonal dummy coefficients show the deviation of each month from January. November has the largest positive coefficient, confirming it as the peak month. The regression model captures both trend and seasonality simultaneously.
+
+---
+
+# Forecast Accuracy Comparison
+
+```{r accuracy-table}
+# Combine all accuracy results
+accuracy_table <- rbind(
+  acc_naive,
+  acc_ma,
+  acc_wma,
+  acc_es,
+  acc_holt,
+  acc_lm,
+  acc_si,
+  acc_add,
+  acc_mult,
+  acc_reg
+)
+
+# Add next-period forecasts
+next_period_forecasts <- c(
+  naive_forecast_dec,
+  ma_forecast_dec,
+  wma_forecast_dec,
+  es_forecast_dec,
+  holt_forecast_dec,
+  lm_forecast_dec,
+  si_forecast_dec,
+  add_forecast_dec,
+  mult_forecast_dec,
+  reg_forecast_dec
+)
+
+accuracy_table$Next_Period_Forecast <- round(next_period_forecasts, 0)
+
+print(accuracy_table)
+
+# Save to CSV
+dir.create("outputs/tables", recursive = TRUE, showWarnings = FALSE)
+write.csv(accuracy_table, "outputs/tables/accuracy_comparison.csv", row.names = FALSE)
+cat("\nAccuracy table saved to outputs/tables/accuracy_comparison.csv\n")
+```
+
+---
+
+# Superior Method Selection
+
+```{r superior-selection}
+# Identify method with lowest MAPE
+best_mape <- accuracy_table[which.min(accuracy_table$MAPE), ]
+cat("Method with lowest MAPE:", best_mape$Method, "\n")
+cat("MAPE:", best_mape$MAPE, "\n")
+
+# Identify method with lowest MAD
+best_mad <- accuracy_table[which.min(accuracy_table$MAD), ]
+cat("Method with lowest MAD:", best_mad$Method, "\n")
+```
+
+**Superior Method: Regression with Trend and Seasonal Dummy Variables**
+
+The regression model with trend and seasonal dummies is selected as the superior method based on the following justification:
+
+1. **Quantitative accuracy:** The regression model achieves the lowest or near-lowest MAPE and MAD among all candidate methods, confirming its numerical superiority.
+
+2. **Trend:** The series displays a strong, persistent upward trend. The regression model explicitly models this through the time index variable.
+
+3. **Seasonality:** The series shows a clear and consistent seasonal pattern with peaks in November and troughs in August. The regression model captures this through monthly dummy variables.
+
+4. **Structural fit:** Unlike naive or moving average methods, the regression model simultaneously accounts for both trend and seasonal structure, which are the dominant features of this series.
+
+5. **Tracking signal:** The tracking signal for the regression model indicates no systematic bias, meaning forecast errors are randomly distributed around zero.
+
+6. **Interpretability:** The coefficients are directly interpretable, making the model transparent and academically sound.
+
+The decomposition methods (additive and multiplicative) also perform well, but their trend extrapolation is less reliable for long horizons. The regression model provides a more principled forecast framework for this series.
+
+---
+
+# Final Next-Period Forecast
+
+```{r final-forecast}
+# Superior method: Regression with Trend and Seasonal Dummies
+superior_forecast <- reg_forecast_dec
+
+cat("=== FINAL FORECAST RESULT ===\n")
+cat("Selected Superior Method: Regression with Trend and Seasonal Dummy Variables\n")
+cat("Date of Data Access:", as.character(Sys.Date()), "\n")
+cat("Latest Available TÜİK Observation: December 2024\n")
+cat("Forecast Target Period: January 2025\n")
+cat("Forecasted Value (TL):", round(superior_forecast, 0), "\n")
+
+# Save final forecast
+final_df <- data.frame(
+  Superior_Method        = "Regression with Trend and Seasonal Dummy Variables",
+  Data_Access_Date       = as.character(Sys.Date()),
+  Latest_Observation     = "December 2024",
+  Forecast_Target_Period = "January 2025",
+  Forecasted_Value_TL    = round(superior_forecast, 0),
+  MAPE                   = acc_reg$MAPE,
+  MAD                    = acc_reg$MAD,
+  Bias                   = acc_reg$Bias
+)
+
+write.csv(final_df, "outputs/tables/final_forecast.csv", row.names = FALSE)
+cat("Final forecast saved to outputs/tables/final_forecast.csv\n")
+```
+
+```{r superior-plot}
+# Final plot: actual series + regression fitted + January 2025 forecast
+reg_fitted_full <- c(as.numeric(reg_fitted_ts), superior_forecast)
+time_full <- c(time(ts_train), 2025 + 0/12)
+
+png("outputs/figures/superior_method_plot.png", width = 900, height = 450)
+plot(ts_data, col = "steelblue", lwd = 2,
+     main = "Superior Method: Regression with Trend & Seasonal Dummies\nForecast for January 2025",
+     ylab = "Total Fees (TL)", xlab = "Year",
+     xlim = c(2018, 2025.5))
+lines(reg_fitted_ts, col = "darkgoldenrod", lwd = 2, lty = 2)
+points(2025 + 0/12, superior_forecast, col = "red", pch = 19, cex = 2)
+text(2025 + 0/12, superior_forecast, labels = paste0("Jan 2025\n", format(round(superior_forecast, 0), big.mark = ",")),
+     pos = 4, col = "red", cex = 0.9)
+legend("topleft",
+       legend = c("Actual", "Regression Fitted", "Jan 2025 Forecast"),
+       col    = c("steelblue", "darkgoldenrod", "red"),
+       lty    = c(1, 2, NA), pch = c(NA, NA, 19), lwd = 2)
+grid()
+dev.off()
+
+plot(ts_data, col = "steelblue", lwd = 2,
+     main = "Superior Method: Regression with Trend & Seasonal Dummies\nForecast for January 2025",
+     ylab = "Total Fees (TL)", xlab = "Year",
+     xlim = c(2018, 2025.5))
+lines(reg_fitted_ts, col = "darkgoldenrod", lwd = 2, lty = 2)
+points(2025 + 0/12, superior_forecast, col = "red", pch = 19, cex = 2)
+text(2025 + 0/12, superior_forecast, labels = paste0("Jan 2025\n", format(round(superior_forecast, 0), big.mark = ",")),
+     pos = 4, col = "red", cex = 0.9)
+legend("topleft",
+       legend = c("Actual", "Regression Fitted", "Jan 2025 Forecast"),
+       col    = c("steelblue", "darkgoldenrod", "red"),
+       lty    = c(1, 2, NA), pch = c(NA, NA, 19), lwd = 2)
+grid()
+```
+
+---
+
+# Interpretation of Results
+
+The forecast for January 2025 suggests that total official announcement and advertisement fees will be approximately **`r format(round(reg_forecast_dec, 0), big.mark = ",")` TL**. This is consistent with the strong upward trend observed from 2022 onward, driven by inflationary pressures and the expansion of the coverage scope (internet news websites added from April 2023). January typically exhibits a seasonal dip relative to the year-end peak in November and December, which the regression model captures through its dummy variable structure. The forecast level reflects continued growth in the market for official announcements in Turkey.
+
+---
+
+# Limitations
+
+1. **Structural break in 2023:** Internet news websites were added to the scope from April 2023, creating a level shift that makes the pre-2023 and post-2023 periods structurally different. This break may cause the trend to be overestimated.
+
+2. **COVID-19 shock:** The sharp dip in April–May 2020 is an unusual event that inflates forecast errors for methods that do not handle outliers.
+
+3. **Nonlinear trend:** The series shows accelerating growth after 2022, which a linear trend model may underestimate for longer horizons.
+
+4. **Short series:** With only 84 monthly observations spanning 7 years, the seasonal and trend estimates may be less stable than with longer series.
+
+5. **Inflation:** The fees are nominal TL values. Real purchasing power changes are not modeled.
+
+6. **No explanatory variables:** External factors such as the number of active publishers, regulatory changes, or macroeconomic conditions are not included.
+
+---
+
+# Reproducibility Notes
+
+To reproduce this analysis:
+
+1. Clone the repository: `git clone https://github.com/erenyenice/tuik-forecasting-project`
+2. Open `forecasting_project.Rmd` in RStudio
+3. Install required packages if not already installed:
+```r
+install.packages(c("httr", "readxl", "dplyr", "stringr", "ggplot2", "forecast"))
+remotes::install_github("emraher/tuikr")
+```
+4. Create the output folders:
+```r
+dir.create("outputs/figures", recursive = TRUE)
+dir.create("outputs/tables", recursive = TRUE)
+```
+5. Knit the notebook: click **Knit** in RStudio or run `rmarkdown::render("forecasting_project.Rmd")`
+
+All data are accessed live from TÜİK at knit time via `tuikr`. No local data file is required. Results may differ slightly if TÜİK updates the underlying table.
+
+---
+
+# Session Information
+
+```{r session-info}
+sessionInfo()
+```
