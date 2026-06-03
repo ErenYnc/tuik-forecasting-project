@@ -1,0 +1,26 @@
+# R environment
+.Rhistory
+.RData
+.Rproj.user/
+.Renviron
+
+# renv cache (lock file is kept, cache is not)
+renv/library/
+renv/staging/
+
+# Temporary files
+*.tmp
+*.temp
+Thumbs.db
+.DS_Store
+
+# RStudio project files
+*.Rproj
+
+# Knitr cache
+*_cache/
+*_files/
+
+# System files
+.idea/
+__pycache__/
